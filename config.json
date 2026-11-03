@@ -41,7 +41,7 @@
       "destination": "NHA",
       "depart_from": "2026-11-10",
       "depart_to": "2026-12-20",
-      "discount_percent": 30
+      "discount_percent": 25
     }
   ]
 }
