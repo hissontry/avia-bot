@@ -6,5 +6,9 @@
   "OVB|NHA|2026-11-28|-|direct": {
     "price": 38918,
     "available": true
+  },
+  "OVB|NHA|2026-11-20..2026-12-20|-|direct": {
+    "price": 38868,
+    "available": true
   }
 }
