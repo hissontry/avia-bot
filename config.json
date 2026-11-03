@@ -16,6 +16,13 @@
       "destination": "NHA",
       "depart_from": "2026-11-20",
       "depart_to": "2026-12-20"
+    },
+    {
+      "name": "Новосибирск → Нячанг, прямой рейс 28.11 в 23:55",
+      "origin": "OVB",
+      "destination": "NHA",
+      "depart_date": "2026-11-28",
+      "direct": true
     }
   ]
 }
