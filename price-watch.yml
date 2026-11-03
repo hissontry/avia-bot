@@ -1,0 +1,44 @@
+name: Price watch
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # каждые 10 минут (GitHub иногда запускает с опозданием)
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Только отправить тестовое сообщение в канал"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: price-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Проверить цены
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
+        run: python3 bot.py ${{ inputs.test && '--test' || '--once' }}
+
+      - name: Сохранить последние цены
+        run: |
+          git config user.name "price-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -f state.json ]; then git add state.json; fi
+          git diff --cached --quiet || git commit -m "Обновлены цены"
+          # GitHub отключает расписание в репозитории без активности 60 дней — раз в месяц делаем пустой коммит
+          if [ $(( $(date +%s) - $(git log -1 --format=%ct) )) -gt 2592000 ]; then
+            git commit --allow-empty -m "keepalive"
+          fi
+          git pull --rebase --quiet && git push --quiet || true

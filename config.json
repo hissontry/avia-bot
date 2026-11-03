@@ -1,0 +1,21 @@
+{
+  "telegram_bot_token": "",
+  "channel_id": "@Lovikibileti",
+  "travelpayouts_token": "",
+
+  "currency": "rub",
+  "check_interval_minutes": 10,
+  "min_change": 2000,
+  "min_change_percent": 0,
+  "notify_on_start": true,
+
+  "routes": [
+    {
+      "name": "Новосибирск → Нячанг",
+      "origin": "OVB",
+      "destination": "NHA",
+      "depart_from": "2026-11-20",
+      "depart_to": "2026-12-20"
+    }
+  ]
+}

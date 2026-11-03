@@ -1,0 +1,35 @@
+{
+  "telegram_bot_token": "ВСТАВЬ_ТОКЕН_ОТ_BOTFATHER",
+  "channel_id": "@имя_твоего_канала",
+  "travelpayouts_token": "ВСТАВЬ_ТОКЕН_TRAVELPAYOUTS",
+
+  "currency": "rub",
+  "check_interval_minutes": 30,
+  "min_change": 0,
+  "min_change_percent": 0,
+  "notify_on_start": true,
+
+  "routes": [
+    {
+      "name": "Москва → Стамбул",
+      "origin": "MOW",
+      "destination": "IST",
+      "depart_date": "2026-12-20",
+      "return_date": "2027-01-05",
+      "direct": false
+    },
+    {
+      "name": "Санкт-Петербург → Сочи, в одну сторону",
+      "origin": "LED",
+      "destination": "AER",
+      "depart_date": "2026-12-28"
+    },
+    {
+      "name": "Новосибирск → Нячанг, любой день в диапазоне",
+      "origin": "OVB",
+      "destination": "NHA",
+      "depart_from": "2026-11-20",
+      "depart_to": "2026-12-20"
+    }
+  ]
+}
