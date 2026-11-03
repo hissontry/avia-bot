@@ -15,6 +15,7 @@ import argparse
 import html
 import json
 import os
+import statistics
 import sys
 import time
 import urllib.error
@@ -97,15 +98,35 @@ def fetch_cheapest(route, cfg):
         tickets = query_prices(route, cfg, route["depart_date"], limit=1)
         return tickets[0] if tickets else None
 
-    # Диапазон дат: API ищет только по дню или месяцу, поэтому берём каждый месяц
-    # диапазона и отбрасываем билеты с вылетом вне [depart_from, depart_to].
-    start, end = route["depart_from"], route["depart_to"]
     best = None
+    for t in fetch_range(route, cfg):
+        if best is None or t["price"] < best["price"]:
+            best = t
+    return best
+
+
+def fetch_range(route, cfg):
+    """Все билеты с вылетом в [depart_from, depart_to].
+
+    API ищет только по дню или месяцу, поэтому берём каждый месяц диапазона
+    и отбрасываем билеты с вылетом вне него.
+    """
+    start, end = route["depart_from"], route["depart_to"]
+    result = []
     for month in months_between(start, end):
         for t in query_prices(route, cfg, month, limit=1000):
             day = (t.get("departure_at") or "")[:10]
-            if start <= day <= end and (best is None or t["price"] < best["price"]):
-                best = t
+            if start <= day <= end:
+                result.append(t)
+    return result
+
+
+def cheapest_by_day(tickets):
+    best = {}
+    for t in tickets:
+        day = t["departure_at"][:10]
+        if day not in best or t["price"] < best[day]["price"]:
+            best[day] = t
     return best
 
 
@@ -223,7 +244,80 @@ def build_message(route, old, new_ticket, cfg):
     )
 
 
+def build_hot_message(route, ticket, usual, cfg):
+    name = route.get("name") or f"{route['origin'].upper()} → {route['destination'].upper()}"
+    off = (1 - ticket["price"] / usual) * 100
+    usual_rounded = round(usual / 100) * 100
+    return (
+        f"🔥 <b>Горячее предложение!</b>\n<b>{html.escape(name)}</b>\n\n"
+        f"💰 <b>{fmt_money(ticket['price'], cfg)}</b> вместо обычных ~{fmt_money(usual_rounded, cfg)} "
+        f"(−{off:.0f}%)\n{ticket_details(ticket, cfg)}"
+    )
+
+
 # ---------- Основная логика ----------
+
+def publish(cfg, message, dry_run, key):
+    """Отправляет сообщение в канал. Возвращает True, если получилось."""
+    if dry_run:
+        print("\n----- сообщение -----\n" + message + "\n---------------------\n")
+        return True
+    try:
+        send_telegram(cfg, message)
+        log(f"{key}: отправлено в канал")
+        return True
+    except Exception as e:
+        log(f"{key}: не удалось отправить в Telegram — {e}")
+        return False
+
+
+def check_hot_deals(cfg, state, dry_run=False):
+    """Ищет дни, когда билет заметно дешевле обычной цены по маршруту.
+
+    Обычная цена — медиана самых дешёвых цен по дням диапазона. День считается
+    горячим, если его цена ниже обычной на discount_percent и больше.
+    """
+    min_change = cfg.get("min_change", 0)
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    for route in cfg.get("hot_deals", []):
+        key = "hot|" + route_key(route)
+        try:
+            days = cheapest_by_day(fetch_range(route, cfg))
+        except Exception as e:
+            log(f"{key}: ошибка запроса цен — {e}")
+            continue
+        days = {d: t for d, t in days.items() if d >= today}
+        if len(days) < 5:
+            log(f"{key}: мало данных для сравнения ({len(days)} дн.)")
+            continue
+
+        usual = statistics.median(t["price"] for t in days.values())
+        pct = route.get("discount_percent", 30)
+        hot = sorted((t for t in days.values() if t["price"] <= usual * (1 - pct / 100)),
+                     key=lambda t: t["price"])
+        seen = state.get(key, {})  # день -> цена, о которой уже написали
+        new_seen = {}
+        sent = 0
+        for t in hot:
+            day = t["departure_at"][:10]
+            prev = seen.get(day)
+            if prev is not None and prev - t["price"] < min_change:
+                new_seen[day] = prev  # уже писали, и сильнее не подешевело
+                continue
+            if sent < 5 and publish(cfg, build_hot_message(route, t, usual, cfg), dry_run, key):
+                new_seen[day] = t["price"]
+                sent += 1
+            elif prev is not None:
+                new_seen[day] = prev
+        # День, который чуть-чуть перестал быть горячим, не забываем сразу,
+        # чтобы не писать о нём повторно при колебаниях цены у порога.
+        for day, price in seen.items():
+            if day not in new_seen and day in days and days[day]["price"] <= usual * (1 - pct / 200):
+                new_seen[day] = price
+        state[key] = new_seen
+        log(f"{key}: обычная цена {usual:.0f}, горячих дней {len(hot)}, отправлено {sent}")
+        time.sleep(1)
 
 def check_all(cfg, state, dry_run=False):
     min_change = cfg.get("min_change", 0)
@@ -259,21 +353,15 @@ def check_all(cfg, state, dry_run=False):
                     message = build_message(route, prev["price"], ticket, cfg)
                     state[key] = {"price": price, "available": True}
 
-        if message:
-            if dry_run:
-                print("\n----- сообщение -----\n" + message + "\n---------------------\n")
+        if message and not publish(cfg, message, dry_run, key):
+            # Не сохраняем новое состояние, чтобы повторить отправку в следующий раз
+            if prev is None:
+                state.pop(key, None)
             else:
-                try:
-                    send_telegram(cfg, message)
-                    log(f"{key}: отправлено в канал")
-                except Exception as e:
-                    log(f"{key}: не удалось отправить в Telegram — {e}")
-                    # Не сохраняем новое состояние, чтобы повторить отправку в следующий раз
-                    if prev is None:
-                        state.pop(key, None)
-                    else:
-                        state[key] = prev
+                state[key] = prev
         time.sleep(1)  # не долбим API слишком часто
+
+    check_hot_deals(cfg, state, dry_run)
 
     if not dry_run:
         save_json(STATE_PATH, state)
@@ -290,6 +378,10 @@ def validate_config(cfg):
                 sys.exit(f"В маршруте {r} не указано поле '{k}'")
         if not r.get("depart_date") and not (r.get("depart_from") and r.get("depart_to")):
             sys.exit(f"В маршруте {r} укажи 'depart_date' или пару 'depart_from' + 'depart_to'")
+    for r in cfg.get("hot_deals", []):
+        for k in ("origin", "destination", "depart_from", "depart_to"):
+            if not r.get(k):
+                sys.exit(f"В горячих предложениях {r} не указано поле '{k}'")
 
 
 def main():

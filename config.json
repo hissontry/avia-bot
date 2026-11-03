@@ -32,5 +32,16 @@
       "depart_date": "2026-11-28",
       "direct": true
     }
+  ],
+
+  "hot_deals": [
+    {
+      "name": "Новосибирск → Нячанг",
+      "origin": "OVB",
+      "destination": "NHA",
+      "depart_from": "2026-11-10",
+      "depart_to": "2026-12-20",
+      "discount_percent": 30
+    }
   ]
 }
