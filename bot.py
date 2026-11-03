@@ -28,6 +28,7 @@ CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
 
 API_URL = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
+SPECIAL_OFFERS_URL = "https://api.travelpayouts.com/aviasales/v3/get_special_offers"
 CURRENCY_SIGNS = {"rub": "₽", "usd": "$", "eur": "€", "kzt": "₸", "uah": "₴", "byn": "Br"}
 
 
@@ -246,12 +247,14 @@ def build_message(route, old, new_ticket, cfg):
 
 def build_hot_message(route, ticket, usual, cfg):
     name = route.get("name") or f"{route['origin'].upper()} → {route['destination'].upper()}"
-    off = (1 - ticket["price"] / usual) * 100
-    usual_rounded = round(usual / 100) * 100
+    price_line = f"💰 <b>{fmt_money(ticket['price'], cfg)}</b>"
+    if usual and ticket["price"] < usual:
+        off = (1 - ticket["price"] / usual) * 100
+        usual_rounded = round(usual / 100) * 100
+        price_line += f" вместо обычных ~{fmt_money(usual_rounded, cfg)} (−{off:.0f}%)"
     return (
         f"🔥 <b>Горячее предложение!</b>\n<b>{html.escape(name)}</b>\n\n"
-        f"💰 <b>{fmt_money(ticket['price'], cfg)}</b> вместо обычных ~{fmt_money(usual_rounded, cfg)} "
-        f"(−{off:.0f}%)\n{ticket_details(ticket, cfg)}"
+        f"{price_line}\n{ticket_details(ticket, cfg)}"
     )
 
 
@@ -271,52 +274,94 @@ def publish(cfg, message, dry_run, key):
         return False
 
 
-def check_hot_deals(cfg, state, dry_run=False):
-    """Ищет дни, когда билет заметно дешевле обычной цены по маршруту.
+def fetch_special_offers(route, cfg):
+    """Спецпредложения Aviasales — билеты с аномально низкой ценой («Горячее предложение»)."""
+    params = {
+        "origin": route["origin"].upper(),
+        "destination": route["destination"].upper(),
+        "currency": cfg.get("currency", "rub"),
+        "market": cfg.get("market", "ru"),
+        "locale": "ru",
+    }
+    url = SPECIAL_OFFERS_URL + "?" + urllib.parse.urlencode(params)
+    data = http_get_json(url, headers={"X-Access-Token": cfg["travelpayouts_token"]})
+    items = data.get("data") or []
+    if isinstance(items, dict):
+        items = list(items.values())
+    return [t for t in items if isinstance(t, dict) and t.get("price") and t.get("departure_at")]
 
-    Обычная цена — медиана самых дешёвых цен по дням диапазона. День считается
-    горячим, если его цена ниже обычной на discount_percent и больше.
+
+def offer_key(ticket):
+    return f"{ticket['departure_at'][:10]}|{ticket.get('airline', '')}{ticket.get('flight_number', '')}"
+
+
+def check_hot_deals(cfg, state, dry_run=False):
+    """Отправляет все горячие предложения с вылетом в [depart_from, depart_to].
+
+    Горячим считается билет из спецпредложений Aviasales, а также день, когда
+    самая дешёвая цена ниже обычной (медиана по дням диапазона) на discount_percent.
     """
     min_change = cfg.get("min_change", 0)
     today = datetime.now().strftime("%Y-%m-%d")
 
     for route in cfg.get("hot_deals", []):
         key = "hot|" + route_key(route)
+        start, end = max(route["depart_from"], today), route["depart_to"]
+        candidates = {}
+        specials_ok = False
+
+        try:
+            specials = fetch_special_offers(route, cfg)
+            specials_ok = True
+            for t in specials:
+                if start <= t["departure_at"][:10] <= end:
+                    candidates[offer_key(t)] = t
+            log(f"{key}: спецпредложений Aviasales {len(specials)}, в нужные даты {len(candidates)}")
+            if specials:
+                log(f"{key}: пример спецпредложения {json.dumps(specials[0], ensure_ascii=False)[:400]}")
+        except Exception as e:
+            log(f"{key}: спецпредложения недоступны — {e}")
+
         try:
             days = cheapest_by_day(fetch_range(route, cfg))
         except Exception as e:
             log(f"{key}: ошибка запроса цен — {e}")
-            continue
-        days = {d: t for d, t in days.items() if d >= today}
-        if len(days) < 5:
-            log(f"{key}: мало данных для сравнения ({len(days)} дн.)")
-            continue
-
-        usual = statistics.median(t["price"] for t in days.values())
+            days = {}
+        days = {d: t for d, t in days.items() if d >= start}
         pct = route.get("discount_percent", 30)
-        hot = sorted((t for t in days.values() if t["price"] <= usual * (1 - pct / 100)),
-                     key=lambda t: t["price"])
-        seen = state.get(key, {})  # день -> цена, о которой уже написали
+        usual = statistics.median(t["price"] for t in days.values()) if len(days) >= 5 else None
+        if usual:
+            for t in days.values():
+                if t["price"] <= usual * (1 - pct / 100):
+                    candidates.setdefault(offer_key(t), t)
+
+        seen = state.get(key, {})  # предложение -> цена, о которой уже написали
         new_seen = {}
         sent = 0
-        for t in hot:
-            day = t["departure_at"][:10]
-            prev = seen.get(day)
+        for k, t in sorted(candidates.items(), key=lambda kv: kv[1]["price"]):
+            # Старые записи хранились по одному дню без номера рейса
+            prev = seen.get(k, seen.get(k[:10]))
             if prev is not None and prev - t["price"] < min_change:
-                new_seen[day] = prev  # уже писали, и сильнее не подешевело
+                new_seen[k] = prev  # уже писали, и сильнее не подешевело
                 continue
-            if sent < 5 and publish(cfg, build_hot_message(route, t, usual, cfg), dry_run, key):
-                new_seen[day] = t["price"]
+            if sent < 20 and publish(cfg, build_hot_message(route, t, usual, cfg), dry_run, key):
+                new_seen[k] = t["price"]
                 sent += 1
             elif prev is not None:
-                new_seen[day] = prev
-        # День, который чуть-чуть перестал быть горячим, не забываем сразу,
+                new_seen[k] = prev
+        # Предложение, которое чуть-чуть перестало быть горячим, не забываем сразу,
         # чтобы не писать о нём повторно при колебаниях цены у порога.
-        for day, price in seen.items():
-            if day not in new_seen and day in days and days[day]["price"] <= usual * (1 - pct / 200):
-                new_seen[day] = price
+        # Если спецпредложения сейчас не ответили, тоже ничего не забываем.
+        handled_days = {k[:10] for k in new_seen}
+        for k, price in seen.items():
+            day = k[:10]
+            near_threshold = (usual and day in days
+                              and days[day]["price"] <= usual * (1 - pct / 200))
+            if day not in handled_days and (near_threshold or not specials_ok) and day >= start:
+                new_seen[k] = price
         state[key] = new_seen
-        log(f"{key}: обычная цена {usual:.0f}, горячих дней {len(hot)}, отправлено {sent}")
+        usual_text = f"{usual:.0f}" if usual else "нет данных"
+        log(f"{key}: обычная цена {usual_text}, горячих {len(candidates)}, отправлено {sent}")
         time.sleep(1)
 
 def check_all(cfg, state, dry_run=False):
