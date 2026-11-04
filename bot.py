@@ -7,6 +7,7 @@
     python bot.py --once     — проверить один раз и выйти (для планировщика задач)
     python bot.py --test     — отправить тестовое сообщение в канал
     python bot.py --dry-run  — проверить цены и напечатать сообщения в консоль, ничего не отправляя
+    python bot.py --report   — проверить один раз и сразу отправить ежедневный отчёт
 
 Нужны только стандартные библиотеки Python 3.8+.
 """
@@ -21,7 +22,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
@@ -260,7 +261,15 @@ def build_hot_message(route, ticket, usual, cfg):
 
 # ---------- Основная логика ----------
 
-def publish(cfg, message, dry_run, key):
+def record_error(state, where, error):
+    """Запоминает ошибку для ежедневного отчёта."""
+    errors = state.setdefault("_errors", [])
+    errors.append({"at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                   "where": where, "text": str(error)[:200]})
+    del errors[:-30]
+
+
+def publish(cfg, message, dry_run, key, state):
     """Отправляет сообщение в канал. Возвращает True, если получилось."""
     if dry_run:
         print("\n----- сообщение -----\n" + message + "\n---------------------\n")
@@ -271,6 +280,7 @@ def publish(cfg, message, dry_run, key):
         return True
     except Exception as e:
         log(f"{key}: не удалось отправить в Telegram — {e}")
+        record_error(state, "Отправка в Telegram", e)
         return False
 
 
@@ -303,6 +313,7 @@ def check_hot_deals(cfg, state, dry_run=False):
     """
     min_change = cfg.get("min_change", 0)
     today = datetime.now().strftime("%Y-%m-%d")
+    hot_total = 0
 
     for route in cfg.get("hot_deals", []):
         key = "hot|" + route_key(route)
@@ -321,11 +332,13 @@ def check_hot_deals(cfg, state, dry_run=False):
                 log(f"{key}: пример спецпредложения {json.dumps(specials[0], ensure_ascii=False)[:400]}")
         except Exception as e:
             log(f"{key}: спецпредложения недоступны — {e}")
+            record_error(state, "Спецпредложения Aviasales", e)
 
         try:
             days = cheapest_by_day(fetch_range(route, cfg))
         except Exception as e:
             log(f"{key}: ошибка запроса цен — {e}")
+            record_error(state, "Горячие предложения", e)
             days = {}
         days = {d: t for d, t in days.items() if d >= start}
         pct = route.get("discount_percent", 30)
@@ -344,7 +357,7 @@ def check_hot_deals(cfg, state, dry_run=False):
             if prev is not None and prev - t["price"] < min_change:
                 new_seen[k] = prev  # уже писали, и сильнее не подешевело
                 continue
-            if sent < 20 and publish(cfg, build_hot_message(route, t, usual, cfg), dry_run, key):
+            if sent < 20 and publish(cfg, build_hot_message(route, t, usual, cfg), dry_run, key, state):
                 new_seen[k] = t["price"]
                 sent += 1
             elif prev is not None:
@@ -360,13 +373,124 @@ def check_hot_deals(cfg, state, dry_run=False):
             if day not in handled_days and (near_threshold or not specials_ok) and day >= start:
                 new_seen[k] = price
         state[key] = new_seen
+        hot_total += len(candidates)
         usual_text = f"{usual:.0f}" if usual else "нет данных"
         log(f"{key}: обычная цена {usual_text}, горячих {len(candidates)}, отправлено {sent}")
         time.sleep(1)
+    return hot_total
 
-def check_all(cfg, state, dry_run=False):
+
+# ---------- Ежедневный отчёт ----------
+
+def kyiv_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        for name in ("Europe/Kyiv", "Europe/Kiev"):
+            try:
+                return ZoneInfo(name)
+            except Exception:
+                pass
+    except ImportError:
+        pass
+    return timezone(timedelta(hours=2))  # зимнее время Киева, если нет базы часовых поясов
+
+
+def github_run_stats():
+    """(проверок за сутки, из них упало) по данным GitHub Actions или None вне GitHub."""
+    token, repo = os.environ.get("GITHUB_TOKEN"), os.environ.get("GITHUB_REPOSITORY")
+    if not token or not repo:
+        return None
+    since = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    current = os.environ.get("GITHUB_RUN_ID")
+    total = failed = 0
+    for page in range(1, 6):
+        query = urllib.parse.urlencode({"created": f">={since}", "per_page": 100, "page": page})
+        data = http_get_json(f"https://api.github.com/repos/{repo}/actions/runs?{query}", headers={
+            "Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
+        runs = data.get("workflow_runs") or []
+        for run in runs:
+            if str(run.get("id")) == current or run.get("status") != "completed":
+                continue
+            total += 1
+            if run.get("conclusion") in ("failure", "timed_out", "startup_failure"):
+                failed += 1
+        if len(runs) < 100:
+            break
+    return total, failed
+
+
+def build_report(cfg, state, prices, hot_total, stats, now):
+    errors = state.get("_errors", [])
+    problems = bool(errors)
+    lines = []
+
+    if stats:
+        total, failed = stats
+        line = f"📊 За сутки: {total} проверок"
+        line += f", упало {failed}" if failed else ", сбоев нет"
+        lines.append(line)
+        if failed:
+            problems = True
+        if total < cfg.get("daily_min_checks", 100):
+            problems = True
+            lines.append("⏰ Проверок меньше обычного (должно быть около 144). "
+                         "Возможно, cron-job.org перестал запускать бота.")
+
+    expires = cfg.get("cron_key_expires")
+    if expires:
+        days_left = (datetime.strptime(expires, "%Y-%m-%d").date() - now.date()).days
+        if days_left <= 7:
+            problems = True
+            lines.append(f"🔑 Ключ для cron-job.org истекает {fmt_date(expires)} "
+                         f"(осталось дней: {max(days_left, 0)}). Его нужно перевыпустить.")
+
+    if errors:
+        grouped = {}
+        for e in errors:
+            grouped.setdefault((e["where"], e["text"]), []).append(e["at"])
+        lines.append(f"❗ Ошибки за сутки: {len(errors)}")
+        for (where, text), times in list(grouped.items())[-5:]:
+            last = datetime.fromisoformat(times[-1]).astimezone(now.tzinfo).strftime("%d.%m %H:%M")
+            count = f" (×{len(times)})" if len(times) > 1 else ""
+            lines.append(f"• {last} — {html.escape(where)}: {html.escape(text)}{count}")
+
+    lines.append("\n💰 Цены сейчас:")
+    for name, price in prices:
+        value = fmt_money(price, cfg) if isinstance(price, int) else f"❌ {price}"
+        lines.append(f"• {html.escape(name)}: {value}")
+    if hot_total is not None and cfg.get("hot_deals"):
+        lines.append(f"🔥 Горячих предложений в твои даты: {hot_total}")
+
+    head = "⚠️ <b>Бот работает, но есть проблемы</b>" if problems else "✅ <b>Бот работает, всё гуд</b>"
+    return f"{head}\n🕙 {now:%d.%m.%Y, %H:%M} по Киеву\n\n" + "\n".join(lines)
+
+
+def maybe_daily_report(cfg, state, prices, hot_total, dry_run=False, force=False):
+    hour = cfg.get("daily_report_hour")
+    if hour is None and not force:
+        return
+    now = datetime.now(kyiv_tz())
+    today = now.strftime("%Y-%m-%d")
+    if not force and (now.hour < hour or state.get("_last_report") == today):
+        return
+    try:
+        stats = github_run_stats()
+    except Exception as e:
+        log(f"Не удалось получить статистику запусков GitHub — {e}")
+        stats = None
+    if publish(cfg, build_report(cfg, state, prices, hot_total, stats, now), dry_run, "Ежедневный отчёт", state):
+        state["_last_report"] = today
+        state["_errors"] = []
+
+
+def route_label(route):
+    return route.get("name") or f"{route['origin'].upper()} → {route['destination'].upper()}"
+
+
+def check_all(cfg, state, dry_run=False, force_report=False):
     min_change = cfg.get("min_change", 0)
     min_change_pct = cfg.get("min_change_percent", 0)
+    prices = []  # для ежедневного отчёта: (маршрут, цена или текст проблемы)
 
     for route in cfg["routes"]:
         key = route_key(route)
@@ -375,7 +499,10 @@ def check_all(cfg, state, dry_run=False):
             ticket = fetch_cheapest(route, cfg)
         except Exception as e:
             log(f"{key}: ошибка запроса цен — {e}")
+            record_error(state, route_label(route), e)
+            prices.append((route_label(route), "не удалось получить цену"))
             continue
+        prices.append((route_label(route), ticket["price"] if ticket else "билетов нет"))
 
         message = None
         if ticket is None:
@@ -398,7 +525,7 @@ def check_all(cfg, state, dry_run=False):
                     message = build_message(route, prev["price"], ticket, cfg)
                     state[key] = {"price": price, "available": True}
 
-        if message and not publish(cfg, message, dry_run, key):
+        if message and not publish(cfg, message, dry_run, key, state):
             # Не сохраняем новое состояние, чтобы повторить отправку в следующий раз
             if prev is None:
                 state.pop(key, None)
@@ -406,7 +533,8 @@ def check_all(cfg, state, dry_run=False):
                 state[key] = prev
         time.sleep(1)  # не долбим API слишком часто
 
-    check_hot_deals(cfg, state, dry_run)
+    hot_total = check_hot_deals(cfg, state, dry_run)
+    maybe_daily_report(cfg, state, prices, hot_total, dry_run, force_report)
 
     if not dry_run:
         save_json(STATE_PATH, state)
@@ -434,6 +562,7 @@ def main():
     parser.add_argument("--once", action="store_true", help="проверить один раз и выйти")
     parser.add_argument("--test", action="store_true", help="отправить тестовое сообщение в канал")
     parser.add_argument("--dry-run", action="store_true", help="ничего не отправлять, только показать")
+    parser.add_argument("--report", action="store_true", help="проверить и сразу отправить ежедневный отчёт")
     args = parser.parse_args()
 
     if not os.path.exists(CONFIG_PATH):
@@ -453,8 +582,8 @@ def main():
         return
 
     state = load_json(STATE_PATH, {})
-    if args.once or args.dry_run:
-        check_all(cfg, state, dry_run=args.dry_run)
+    if args.once or args.dry_run or args.report:
+        check_all(cfg, state, dry_run=args.dry_run, force_report=args.report)
         return
 
     interval = max(5, int(cfg.get("check_interval_minutes", 30))) * 60

@@ -8,6 +8,9 @@
   "min_change": 2000,
   "min_change_percent": 0,
   "notify_on_start": true,
+  "daily_report_hour": 10,
+  "daily_min_checks": 100,
+  "cron_key_expires": "2027-01-02",
 
   "routes": [
     {
