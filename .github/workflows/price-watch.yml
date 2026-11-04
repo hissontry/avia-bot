@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: write
+  actions: read   # чтобы ежедневный отчёт мог посчитать запуски за сутки
 
 concurrency:
   group: price-watch
@@ -29,6 +30,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: python3 bot.py ${{ inputs.test && '--test' || '--once' }}
 
       - name: Сохранить последние цены
