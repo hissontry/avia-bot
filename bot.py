@@ -97,7 +97,10 @@ def months_between(start, end):
 def fetch_cheapest(route, cfg):
     """Возвращает самый дешёвый билет по маршруту (dict) или None, если билетов нет."""
     if not route.get("depart_from"):
-        tickets = query_prices(route, cfg, route["depart_date"], limit=1)
+        # Для конкретной авиакомпании берём больше билетов и оставляем только её рейсы
+        limit = 30 if route.get("airline") else 1
+        tickets = [t for t in query_prices(route, cfg, route["depart_date"], limit=limit)
+                   if matches_airline(route, t)]
         return tickets[0] if tickets else None
 
     best = None
@@ -118,9 +121,13 @@ def fetch_range(route, cfg):
     for month in months_between(start, end):
         for t in query_prices(route, cfg, month, limit=1000):
             day = (t.get("departure_at") or "")[:10]
-            if start <= day <= end:
+            if start <= day <= end and matches_airline(route, t):
                 result.append(t)
     return result
+
+
+def matches_airline(route, ticket):
+    return not route.get("airline") or ticket.get("airline") == route["airline"].upper()
 
 
 def cheapest_by_day(tickets):
@@ -134,13 +141,16 @@ def cheapest_by_day(tickets):
 
 def route_key(route):
     depart = route.get("depart_date") or f"{route['depart_from']}..{route['depart_to']}"
-    return "|".join([
+    parts = [
         route["origin"].upper(),
         route["destination"].upper(),
         depart,
         route.get("return_date") or "-",
         "direct" if route.get("direct") else "any",
-    ])
+    ]
+    if route.get("airline"):
+        parts.append(route["airline"].upper())
+    return "|".join(parts)
 
 
 # ---------- Telegram ----------
@@ -454,10 +464,13 @@ def build_report(cfg, state, prices, hot_total, stats, now):
             count = f" (×{len(times)})" if len(times) > 1 else ""
             lines.append(f"• {last} — {html.escape(where)}: {html.escape(text)}{count}")
 
-    lines.append("\n💰 Цены сейчас:")
-    for name, price in prices:
+    lines.append("\n💰 Цены сейчас и движение за сутки:")
+    history = state.get("_history", {})
+    for name, price, key in prices:
         value = fmt_money(price, cfg) if isinstance(price, int) else f"❌ {price}"
-        lines.append(f"• {html.escape(name)}: {value}")
+        lines.append(f"• <b>{html.escape(name)}</b>: {value}")
+        if key in history:
+            lines.append(f"   {price_movement(history[key], now, cfg)}")
     if hot_total is not None and cfg.get("hot_deals"):
         lines.append(f"🔥 Горячих предложений в твои даты: {hot_total}")
 
@@ -483,6 +496,34 @@ def maybe_daily_report(cfg, state, prices, hot_total, dry_run=False, force=False
         state["_errors"] = []
 
 
+def record_price(state, key, price):
+    """Запоминает каждое изменение цены для статистики в ежедневном отчёте."""
+    now = datetime.now(timezone.utc)
+    history = state.setdefault("_history", {}).setdefault(key, [])
+    if not history or history[-1][1] != price:
+        history.append([now.isoformat(timespec="seconds"), price])
+    # Храним двое суток, но не меньше одной точки — она нужна как цена на начало суток
+    cutoff = (now - timedelta(days=2)).isoformat(timespec="seconds")
+    while len(history) > 1 and history[1][0] < cutoff:
+        history.pop(0)
+
+
+def price_movement(history, now, cfg):
+    """Строка о том, как менялась цена за последние сутки."""
+    since = (now - timedelta(days=1)).astimezone(timezone.utc).isoformat(timespec="seconds")
+    before = [p for ts, p in history if ts < since]
+    seq = before[-1:] + [p for ts, p in history if ts >= since]
+    if len(seq) < 2:
+        return "за сутки без изменений"
+    steps = [b - a for a, b in zip(seq, seq[1:])]
+    downs, ups = sum(1 for s in steps if s < 0), sum(1 for s in steps if s > 0)
+    diff = seq[-1] - seq[0]
+    sign = "+" if diff > 0 else "−" if diff < 0 else "±"
+    return (f"за сутки: {fmt_money(seq[0], cfg)} → {fmt_money(seq[-1], cfg)} "
+            f"({sign}{fmt_money(abs(diff), cfg)}), изменений {len(steps)} (↓{downs} ↑{ups}), "
+            f"мин {fmt_money(min(seq), cfg)}, макс {fmt_money(max(seq), cfg)}")
+
+
 def route_label(route):
     return route.get("name") or f"{route['origin'].upper()} → {route['destination'].upper()}"
 
@@ -495,14 +536,17 @@ def check_all(cfg, state, dry_run=False, force_report=False):
     for route in cfg["routes"]:
         key = route_key(route)
         prev = state.get(key)  # {"price": ..., "available": bool}
+        route_min_change = route.get("min_change", min_change)  # у маршрута может быть свой порог
         try:
             ticket = fetch_cheapest(route, cfg)
         except Exception as e:
             log(f"{key}: ошибка запроса цен — {e}")
             record_error(state, route_label(route), e)
-            prices.append((route_label(route), "не удалось получить цену"))
+            prices.append((route_label(route), "не удалось получить цену", key))
             continue
-        prices.append((route_label(route), ticket["price"] if ticket else "билетов нет"))
+        prices.append((route_label(route), ticket["price"] if ticket else "билетов нет", key))
+        if ticket:
+            record_price(state, key, ticket["price"])
 
         message = None
         if ticket is None:
@@ -520,7 +564,7 @@ def check_all(cfg, state, dry_run=False, force_report=False):
             elif not prev.get("available") or price != prev["price"]:
                 diff = abs(price - prev["price"])
                 pct = diff / prev["price"] * 100 if prev["price"] else 100
-                big_enough = diff >= min_change and pct >= min_change_pct
+                big_enough = diff >= route_min_change and pct >= min_change_pct
                 if not prev.get("available") or (diff > 0 and big_enough):
                     message = build_message(route, prev["price"], ticket, cfg)
                     state[key] = {"price": price, "available": True}
