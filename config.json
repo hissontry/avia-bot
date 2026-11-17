@@ -36,13 +36,14 @@
       "direct": true
     },
     {
-      "name": "Аэрофлот 02.12 в 23:55, прямой (строго)",
+      "name": "Аэрофлот 02.12 в 23:55, прямой",
       "origin": "OVB",
       "destination": "NHA",
       "depart_date": "2026-12-02",
       "direct": true,
       "airline": "SU",
-      "min_change": 0
+      "price_step": 1000,
+      "step_hysteresis": 100
     }
   ],
 

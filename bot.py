@@ -496,6 +496,34 @@ def maybe_daily_report(cfg, state, prices, hot_total, dry_run=False, force=False
         state["_errors"] = []
 
 
+def check_step(route, prev, ticket, cfg):
+    """Порог-лесенка: сообщение, когда цена пересекает уровень, кратный price_step.
+
+    Возвращает (сообщение или None, новое состояние или None).
+    Если цена разворачивается через тот же уровень, ждём запаса step_hysteresis,
+    чтобы колебания вокруг уровня не давали спама.
+    """
+    step, hyst = route["price_step"], route.get("step_hysteresis", 100)
+    price = ticket["price"]
+    band = price // step
+    old = prev.get("band")
+    if old is None:  # впервые включили лесенку — запоминаем текущий уровень молча
+        return None, {**prev, "band": band}
+    if band == old:
+        return None, None
+    down = band < old
+    boundary = (band + 1) * step if down else band * step
+    reversing = prev.get("dir") == ("up" if down else "down")
+    if reversing and abs(price - boundary) < hyst:
+        return None, None
+    head = (f"📉 <b>Цена опустилась ниже {fmt_money(boundary, cfg)}</b>" if down
+            else f"📈 <b>Цена поднялась выше {fmt_money(boundary, cfg)}</b>")
+    message = (f"{head}\n{route_title(route)}\n\n"
+               f"💰 Было: {fmt_money(prev['price'], cfg)} → Стало: <b>{fmt_money(price, cfg)}</b>\n"
+               f"{ticket_details(ticket, cfg)}")
+    return message, {"price": price, "available": True, "band": band, "dir": "down" if down else "up"}
+
+
 def record_price(state, key, price):
     """Запоминает каждое изменение цены для статистики в ежедневном отчёте."""
     now = datetime.now(timezone.utc)
@@ -557,7 +585,11 @@ def check_all(cfg, state, dry_run=False, force_report=False):
         else:
             price = ticket["price"]
             log(f"{key}: {price}")
-            if prev is None:
+            if route.get("price_step") and prev is not None and prev.get("available"):
+                message, new_state = check_step(route, prev, ticket, cfg)
+                if new_state:
+                    state[key] = new_state
+            elif prev is None:
                 if cfg.get("notify_on_start", True):
                     message = build_message(route, None, ticket, cfg)
                 state[key] = {"price": price, "available": True}
